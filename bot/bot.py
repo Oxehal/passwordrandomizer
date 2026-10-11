@@ -1,135 +1,114 @@
 import os
 import io
+import json
 import asyncio
-from aiohttp import web
+import aiohttp
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart
 from google import genai
 from google.genai import types as genai_types
-import gspread
-from oauth2client.service_account import ServiceAccountCredentials
 
-# === НАСТРОЙКИ (лучше прописать в Environment Variables на Render) ===
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-GEMINI_API_KEY     = os.getenv("GEMINI_API_KEY")
-ALLOWED_CHAT_ID    = int(os.getenv("TELEGRAM_CHAT_ID", "1266251966"))
-SPREADSHEET_ID     = os.getenv("SPREADSHEET_ID", "")  # ID таблицы из её URL
+# Токены и настройки
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GOOGLE_SHEET_WEBHOOK = "https://script.google.com/macros/s/AKfycbyFvhCTAWhZfTwuhZ_RLXNIy4p7XvHhryJVII-CLlWDWrDs2qHyAChCor3PgExSosL8/exec"
 
-# Инициализация клиентов
-bot = Bot(token=TELEGRAM_BOT_TOKEN)
+bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
+
+# Инициализация Gemini
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
+PROMPT = """
+Ты — логистический ассистент. Твоя задача — извлечь данные о рейсе или дебиторской задолженности из сообщения водителя/диспетчера.
+Верни ТОЛЬКО валидный JSON со следующими ключами:
+- company: Название контрагента/заказчика (например: "ООО Восток")
+- orderInfo: Описание рейса, маршрут или номер заявки (например: "рейс 415 Казань - Москва")
+- debtAmount: Сумма долга или ставка чистым числом без пробелов и валюты (например: 85000)
+- contractDays: Срок оплаты в днях числом (если не сказано, поставь 30)
+- atiCode: Код АТИ фирмы, если упомянут (число или строка), иначе null
+- email: Почта, если упомянута, иначе null
 
-def get_sheet():
-    """Подключение к Google Sheets через Service Account (service_account.json)"""
-    scope = [
-        "https://spreadsheets.google.com/feeds",
-        "https://www.googleapis.com/auth/drive"
-    ]
-    # Файл ключа от сервисного аккаунта Google Cloud
-    creds = ServiceAccountCredentials.from_json_keyfile_name("service_account.json", scope)
-    client = gspread.authorize(creds)
-    return client.open_by_key(SPREADSHEET_ID).sheet1
+Формат строго JSON, без markdown разметки ```json:
+{
+  "company": "...",
+  "orderInfo": "...",
+  "debtAmount": 0,
+  "contractDays": 30,
+  "atiCode": null,
+  "email": null
+}
+"""
 
+async def send_to_sheets(data: dict):
+    """Отправка данных в Google Таблицу через вебхук"""
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(GOOGLE_SHEET_WEBHOOK, json=data, timeout=10) as resp:
+                return resp.status == 200
+    except Exception as e:
+        print(f"Ошибка отправки в таблицу: {e}")
+        return False
 
 @dp.message(CommandStart())
-async def handle_start(message: types.Message):
-    if message.chat.id != ALLOWED_CHAT_ID:
-        return
+async def cmd_start(message: types.Message):
     await message.answer(
         "👋 На связи! Надиктуй голосовым или напиши рейс в свободной форме.\n\n"
-        "Пример:\n«ООО Восток, рейс 415 Казань, сумма 85 000, код ати 998877, 10 дней»"
+        "Пример:\n"
+        "«ООО Восток, рейс 415 Казань, сумма 85 000, код ати 998877, 10 дней»"
     )
 
-
-@dp.message(F.voice)
-async def handle_voice(message: types.Message):
-    if message.chat.id != ALLOWED_CHAT_ID:
-        return
-
-    status_msg = await message.answer("🎧 Скачиваю и слушаю голосовое...")
-
-    # Скачивание аудио в память
-    voice_file = await bot.get_file(message.voice.file_id)
-    voice_buffer = io.BytesIO()
-    await bot.download_file(voice_file.file_path, destination=voice_buffer)
-    voice_bytes = voice_buffer.getvalue()
-
-    prompt = (
-        "Ты — парсер для логистики. Внимательно прослушай аудио на русском языке и верни JSON со свойствами: "
-        "atiCode (строка/число, default ''), company (строка), orderInfo (строка), "
-        "debtAmount (только число), contractDays (число, default 30), email (строка, default '')."
-    )
-
+@dp.message(F.voice | F.text)
+async def handle_payload(message: types.Message):
+    status_msg = await message.answer("🎧 Обрабатываю данные...")
+    
     try:
-        response = gemini_client.models.generate_content(
-            model="gemini-3.8-flash",
-            contents=[
-                prompt,
-                genai_types.Part.from_bytes(data=voice_bytes, mime_type="audio/ogg")
-            ],
-            config=genai_types.GenerateContentConfig(
-                response_mime_type="application/json",
-                temperature=0.1
+        if message.voice:
+            # Скачиваем голосовое сообщение в память
+            file_info = await bot.get_file(message.voice.file_id)
+            voice_file = io.BytesIO()
+            await bot.download_file(file_info.file_path, destination=voice_file)
+            voice_bytes = voice_file.getvalue()
+
+            # Запрос к Gemini (через to_thread для ускорения)
+            response = await asyncio.to_thread(
+                gemini_client.models.generate_content,
+                model="gemini-3.8-flash",
+                contents=[
+                    PROMPT,
+                    genai_types.Part.from_bytes(data=voice_bytes, mime_type="audio/ogg")
+                ],
+                config=genai_types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    temperature=0.1
+                )
             )
+        else:
+            response = await asyncio.to_thread(
+                gemini_client.models.generate_content,
+                model="gemini-3.8-flash",
+                contents=[PROMPT, message.text],
+                config=genai_types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    temperature=0.1
+                )
+            )
+
+        text_json = response.text.strip()
+        data = json.loads(text_json)
+
+        # Отправляем данные в Google Таблицу
+        sheet_success = await send_to_sheets(data)
+
+        # Красивый вывод для Telegram
+        reply = (
+            "✅ **Рейс успешно разобран!**\n\n"
+            f"🏢 **Контрагент:** {data.get('company', '—')}\n"
+            f"🚛 **Рейс:** {data.get('orderInfo', '—')}\n"
+            f"💰 **Сумма:** {data.get('debtAmount', 0)} руб.\n"
+            f"⏱ **Срок:** {data.get('contractDays', 30)} дн.\n"
+            f"🌐 **Код АТИ:** {data.get('atiCode') or '—'}\n\n"
         )
-        import json
-        data = json.loads(response.text)
-
-        if not data.get("company"):
-            await status_msg.edit_text("⚠️ Не удалось распознать организацию. Надиктуй ещё раз.")
-            return
-
-        # Добавление в Google Sheets
-        if SPREADSHEET_ID and os.path.exists("service_account.json"):
-            sheet = get_sheet()
-            next_row = len(sheet.get_all_values()) + 1
-            ati_formula = f'=HYPERLINK("https://ati.su/firms/{data.get("atiCode")}/claims"; "🔍 Профиль АТИ")' if data.get("atiCode") else ""
-            row_data = [
-                data.get("atiCode", ""),
-                data.get("company", ""),
-                "",
-                data.get("orderInfo", ""),
-                float(data.get("debtAmount", 0)),
-                "", "", "", "", "", "", "", "",
-                int(data.get("contractDays", 30)),
-                data.get("email", ""),
-                ati_formula
-            ]
-            sheet.append_row(row_data, value_input_option="USER_ENTERED")
-
-        text_reply = (
-            f"✅ *Рейс успешно разобран!*\n\n"
-            f"🏢 *Контрагент:* {data.get('company')}\n"
-            f"🚛 *Рейс:* {data.get('orderInfo', 'не указан')}\n"
-            f"💰 *Сумма:* {data.get('debtAmount')} руб.\n"
-            f"⏱ *Срок:* {data.get('contractDays', 30)} дн.\n"
-            f"🌐 *Код АТИ:* {data.get('atiCode', 'нет')}"
-        )
-        await status_msg.edit_text(text_reply, parse_mode="Markdown")
-
-    except Exception as e:
-        await status_msg.edit_text(f"⚠️ Ошибка обработки: {str(e)}")
-
-
-async def run_web_server():
-    """Фиктивный веб-сервер, чтобы Render не считал сервис упавшим"""
-    app = web.Application()
-    app.router.add_get("/", lambda req: web.Response(text="Bot is running!"))
-    port = int(os.getenv("PORT", 8080))
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
-
-
-async def main():
-    await bot.delete_webhook(drop_pending_updates=True)
-    await asyncio.gather(
-        run_web_server(),
-        dp.start_polling(bot)
-    )
-
-if __name__ == "__main__":
-    asyncio.run(main())
+        
+        if sheet_success:
+            reply +=
