@@ -64,7 +64,7 @@ async def handle_voice(message: types.Message):
 
     try:
         response = gemini_client.models.generate_content(
-            model="gemini-2.5-flash",
+            model="gemini-3.8-flash",
             contents=[
                 prompt,
                 genai_types.Part.from_bytes(data=voice_bytes, mime_type="audio/ogg")
